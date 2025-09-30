@@ -1,0 +1,210 @@
+import cv2
+import serial
+import time
+import joblib
+import numpy as np
+from ultralytics import YOLO
+import datetime
+import csv
+import pandas as pd
+import os
+import threading
+from collections import deque
+
+# Load model
+yolo_model = YOLO("D:/Downloads/best (9).pt")
+rf_model = joblib.load("D:/skripsi/RF/modelRFfinal16.joblib")
+label_encoders = joblib.load("D:/skripsi/RF/labelRFfinal16.joblib")
+rf_feature_names = ['Jenis_Obyek', 'Jarak_Kiri_cm', 'Jarak_Tengah_cm', 'Jarak_Kanan_cm', 'Sensor_Relevan']
+
+# Arduino dan kamera
+arduino = serial.Serial('COM6', 115200, timeout=1)
+time.sleep(2)
+cap = cv2.VideoCapture(1)
+if not cap.isOpened():
+    print("Kamera gagal dibuka")
+    exit()
+
+# Pembacaan sensor ultrasonik
+ultrasonic_data = (999.99, 999.99, 999.99)
+def baca_ultrasonik():
+    global ultrasonic_data
+    while True:
+        if arduino.in_waiting > 0:
+            try:
+                line = arduino.readline().decode('utf-8').strip()
+                jarak_kiri, jarak_tengah, jarak_kanan = map(float, line.split(','))
+                ultrasonic_data = (jarak_kiri, jarak_tengah, jarak_kanan)
+            except:
+                continue
+
+threading.Thread(target=baca_ultrasonik, daemon=True).start()
+
+# Direktori output
+run_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+output_dir = f"hasil_{run_timestamp}"
+os.makedirs(output_dir, exist_ok=True)
+csv_filename = os.path.join(output_dir, f"data_{run_timestamp}.csv")
+video_filename = os.path.join(output_dir, f"video_{run_timestamp}.mp4")
+
+# Video writer dan CSV
+frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+out = cv2.VideoWriter(video_filename, fourcc, 20.0, (frame_width, frame_height))
+
+csv_file = open(csv_filename, 'w', newline='')
+csv_writer = csv.writer(csv_file)
+csv_writer.writerow(['Timestamp_Deteksi', 'Timestamp_Keputusan', 'Response_Time_ms',
+                     'Jenis Objek', 'Confidence Score','Jarak Kiri (cm)', 'Jarak Tengah (cm)',
+                     'Jarak Kanan (cm)', 'Jarak Awal (cm)', 'Sensor_Relevan', 'Keputusan', 'FPS'])
+
+# Fungsi zona sensor kamera
+def get_sensor_from_xcenter(x_center):
+    if x_center < 173:
+        return 1, 'Kiri'
+    elif x_center < 346:
+        return 2, 'Tengah'
+    elif x_center < 520:
+        return 3, 'Kanan'
+    else:
+        return 4, 'ABAIAKAN'
+
+# Runtime
+prev_frame_time = 0
+jarak_awal = -1
+keputusan_buffer = deque()
+target_durasi = 1.0
+
+while True:
+    frame_start_time = time.time()  # Mulai hitung response time per frame
+
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    current_timestamp = datetime.datetime.now()
+    current_timestamp_str = current_timestamp.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = yolo_model.predict(frame_rgb, verbose=False, conf=0.25)
+    jarak_kiri_cm, jarak_tengah_cm, jarak_kanan_cm = ultrasonic_data
+
+    # Garis zona
+    cv2.line(frame, (173, 0), (173, frame_height), (255, 255, 0), 2)
+    cv2.line(frame, (346, 0), (346, frame_height), (0, 255, 255), 2)
+    cv2.line(frame, (520, 0), (520, frame_height), (0, 0, 255), 2)
+
+    jenis_objek_rf = '-'
+    confidence_score = 0.0
+    keputusan = '-'
+    sensor_utama = '-'
+    main_object = None
+    min_score = float('inf') 
+    bbox_main = None
+
+    boxes = results[0].boxes.xyxy.cpu().numpy()
+    scores = results[0].boxes.conf.cpu().numpy()
+    classes = results[0].boxes.cls.cpu().numpy()
+    yolo_class_names = results[0].names
+
+    for i, box in enumerate(boxes):
+        x1, y1, x2, y2 = map(int, box)
+        conf = scores[i]
+        cls_id = int(classes[i])
+        label = yolo_class_names[cls_id]
+
+        if label in ['mobil', 'motor', 'orang']:
+            x_center = (x1 + x2) // 2
+            zone_id, sensor = get_sensor_from_xcenter(x_center)
+            if zone_id == 4:
+                continue
+
+            jarak_sensor = {'Kiri': jarak_kiri_cm, 'Tengah': jarak_tengah_cm, 'Kanan': jarak_kanan_cm}.get(sensor, 9999)
+            combined_score = jarak_sensor
+
+            if combined_score < min_score:
+                min_score = combined_score
+                jenis_objek_rf = label
+                confidence_score = conf
+                sensor_utama = sensor
+                jarak_awal = jarak_sensor
+                bbox_main = (x1, y1, x2, y2)
+                main_object = (label, sensor)
+
+    if bbox_main:
+        x1, y1, x2, y2 = bbox_main
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+
+    # Input ke model RF
+    input_data = pd.DataFrame({
+        'Jenis_Obyek': [jenis_objek_rf],
+        'Jarak_Kiri_cm': [round(jarak_kiri_cm, 3)],
+        'Jarak_Tengah_cm': [round(jarak_tengah_cm, 3)],
+        'Jarak_Kanan_cm': [round(jarak_kanan_cm, 3)],
+        'Sensor_Relevan': [sensor_utama]
+    })
+
+    try:
+        for col in ['Jenis_Obyek', 'Sensor_Relevan']:
+            input_data[col] = label_encoders[col].transform(input_data[col])
+        pred = rf_model.predict(input_data[rf_feature_names])
+        keputusan_pred = label_encoders['Keputusan'].inverse_transform(pred)[0]
+    except Exception as e:
+        print(f"[FALLBACK] Gagal prediksi model RF: {e}")
+        keputusan_pred = 'BERHENTI'
+
+    frame_end_time = time.time()
+    response_time_ms = (frame_end_time - frame_start_time) * 1000  # Response time per frame
+
+    new_frame_time = time.time()
+    fps = 1 / (new_frame_time - prev_frame_time) if prev_frame_time != 0 else 0
+    prev_frame_time = new_frame_time
+
+    n = max(3, int(fps * target_durasi))
+    keputusan_buffer.append(keputusan_pred)
+    if len(keputusan_buffer) > n:
+        keputusan_buffer.popleft()
+    keputusan = max(set(keputusan_buffer), key=keputusan_buffer.count)
+
+    confidence_score = round(confidence_score, 2)
+    jarak_awal = round(jarak_awal, 3) if isinstance(jarak_awal, (int, float)) else jarak_awal
+
+    y_pos = 20
+    for text in [
+        f"Timestamp: {current_timestamp_str}",
+        f"Jenis: {jenis_objek_rf}",
+        f"Conf: {confidence_score:.2f}",
+        f"Jarak Kiri: {round(jarak_kiri_cm, 3)} cm",
+        f"Jarak Tengah: {round(jarak_tengah_cm, 3)} cm",
+        f"Jarak Kanan: {round(jarak_kanan_cm, 3)} cm",
+        f"Sensor Relevan: {sensor_utama}",
+        f"Keputusan: {keputusan}",
+        f"RespTime: {response_time_ms:.2f} ms"
+    ]:
+        cv2.putText(frame, text, (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 3)
+        cv2.putText(frame, text, (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+        y_pos += 18
+
+    # Simpan ke CSV
+    csv_writer.writerow([
+        current_timestamp_str,
+        current_timestamp_str,
+        f"{response_time_ms:.2f}",
+        jenis_objek_rf, confidence_score,
+        round(jarak_kiri_cm, 3), round(jarak_tengah_cm, 3), round(jarak_kanan_cm, 3),
+        jarak_awal, sensor_utama, keputusan, f"{fps:.2f}"
+    ])
+
+    cv2.imshow("Autonomous Vehicle View", frame)
+    out.write(frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+out.release()
+arduino.close()
+csv_file.close()
+cv2.destroyAllWindows()
+print(f"[SELESAI] File CSV dan video berhasil disimpan di folder: {output_dir}")
+
